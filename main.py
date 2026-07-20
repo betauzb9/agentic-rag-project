@@ -1,7 +1,10 @@
 import os
+import tempfile
 from typing import List, TypedDict
 
-from fastapi import FastAPI
+import fitz
+import base64
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -20,32 +23,55 @@ if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
 
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+vision_llm = ChatOpenAI(model="gpt-4o-mini")
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
-# ---------- Load and ingest the default document ----------
-DEFAULT_DOC_PATH = os.path.join(os.path.dirname(__file__), "data", "alice_in_wonderland.txt")
+# ---------- Vector store (in-memory, resets on each upload) ----------
+client = QdrantClient(location=":memory:")
+COLLECTION_NAME = "agentic_rag"
 
-def load_default_document():
+def reset_collection():
+    try:
+        client.delete_collection(COLLECTION_NAME)
+    except Exception:
+        pass
+    client.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+    )
+
+reset_collection()
+vectorstore = QdrantVectorStore(client=client, collection_name=COLLECTION_NAME, embedding=embeddings)
+retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+
+document_loaded = False
+
+# ---------- Ingestion helpers ----------
+def caption_image(image_bytes):
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    msg = vision_llm.invoke([{"role": "user", "content": [
+        {"type": "text", "text": "Describe what is shown in this image, briefly."},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+    ]}])
+    return msg.content
+
+def ingest_pdf(path: str, filename: str):
     docs = []
-    if os.path.exists(DEFAULT_DOC_PATH):
-        with open(DEFAULT_DOC_PATH, "r", encoding="utf-8") as f:
-            text = f.read()
-        docs.append(Document(page_content=text, metadata={"source": "alice_in_wonderland.txt"}))
+    pdf = fitz.open(path)
+    for page_num, page in enumerate(pdf):
+        text = page.get_text()
+        if text.strip():
+            docs.append(Document(page_content=text, metadata={"source": filename, "page": page_num}))
+        for img in page.get_images(full=True):
+            base_image = pdf.extract_image(img[0])
+            caption = caption_image(base_image["image"])
+            docs.append(Document(page_content=f"[Image] {caption}", metadata={"source": filename, "page": page_num}))
     return docs
 
-raw_docs = load_default_document()
-chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150).split_documents(raw_docs)
-
-client = QdrantClient(location=":memory:")
-client.create_collection(
-    collection_name="agentic_rag",
-    vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
-)
-vectorstore = QdrantVectorStore(client=client, collection_name="agentic_rag", embedding=embeddings)
-if chunks:
-    vectorstore.add_documents(chunks)
-
-retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+def ingest_text(path: str, filename: str):
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        text = f.read()
+    return [Document(page_content=text, metadata={"source": filename})]
 
 # ---------- Graph state ----------
 class GraphState(TypedDict):
@@ -61,9 +87,8 @@ class YesNo(BaseModel):
 
 doc_grader = ChatPromptTemplate.from_messages([
     ("system", "You are grading whether a document chunk is relevant to a user's question. "
-               "The chunk may be in a different language than the question — judge by meaning, not language. "
-               "If the chunk is part of the same book/document the question is about, or touches the topic "
-               "even loosely, answer 'yes'. Only answer 'no' if the chunk is clearly about something unrelated."),
+               "Judge by meaning, not language. If the chunk touches the topic even loosely, answer 'yes'. "
+               "Only answer 'no' if the chunk is clearly about something unrelated."),
     ("human", "Document: {document}\n\nQuestion: {question}")
 ]) | llm.with_structured_output(YesNo)
 
@@ -118,7 +143,6 @@ def route_after_generate(state):
     useful = answer_grader.invoke({"question": state["question"], "generation": state["generation"]}).binary_score
     return "useful" if useful == "yes" else "not_useful"
 
-# ---------- Build the graph ----------
 g = StateGraph(GraphState)
 g.add_node("retrieve", retrieve)
 g.add_node("grade_documents", grade_documents)
@@ -145,11 +169,39 @@ api.add_middleware(
 class ChatIn(BaseModel):
     question: str
 
+@api.post("/upload")
+async def upload_document(file: UploadFile = File(...)):
+    global document_loaded
+    suffix = os.path.splitext(file.filename)[1].lower()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+
+    if suffix == ".pdf":
+        docs = ingest_pdf(tmp_path, file.filename)
+    else:
+        docs = ingest_text(tmp_path, file.filename)
+
+    os.remove(tmp_path)
+
+    chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150).split_documents(docs)
+
+    reset_collection()
+    global vectorstore, retriever
+    vectorstore = QdrantVectorStore(client=client, collection_name=COLLECTION_NAME, embedding=embeddings)
+    vectorstore.add_documents(chunks)
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+    document_loaded = True
+
+    return {"status": "ok", "filename": file.filename, "chunks": len(chunks)}
+
 @api.post("/chat")
 def chat(body: ChatIn):
+    if not document_loaded:
+        return {"answer": "Please upload a document first using /upload.", "steps": [], "sources": []}
     r = rag_app.invoke({"question": body.question, "steps": [], "retries": 0})
     return {"answer": r["generation"], "steps": r["steps"], "sources": r["sources"]}
 
 @api.get("/health")
 def health():
-    return {"status": "ok", "chunks_loaded": len(chunks)}
+    return {"status": "ok", "document_loaded": document_loaded}
