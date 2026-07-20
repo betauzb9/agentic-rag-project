@@ -17,7 +17,6 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 from langgraph.graph import StateGraph, END
 
-# ---------- Config ----------
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
@@ -26,7 +25,6 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 vision_llm = ChatOpenAI(model="gpt-4o-mini")
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
-# ---------- Vector store (in-memory, resets on each upload) ----------
 client = QdrantClient(location=":memory:")
 COLLECTION_NAME = "agentic_rag"
 
@@ -46,7 +44,6 @@ retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
 document_loaded = False
 
-# ---------- Ingestion helpers ----------
 def caption_image(image_bytes):
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     msg = vision_llm.invoke([{"role": "user", "content": [
@@ -73,7 +70,6 @@ def ingest_text(path: str, filename: str):
         text = f.read()
     return [Document(page_content=text, metadata={"source": filename})]
 
-# ---------- Graph state ----------
 class GraphState(TypedDict):
     question: str
     documents: List[Document]
@@ -108,7 +104,6 @@ rag_chain = ChatPromptTemplate.from_messages([
     ("human", "Question: {question}\n\nDocuments:\n{context}")
 ]) | llm
 
-# ---------- Graph nodes ----------
 def retrieve(state):
     docs = retriever.invoke(state["question"])
     return {"documents": docs, "steps": state.get("steps", []) + ["retrieve"]}
@@ -156,7 +151,6 @@ g.add_conditional_edges("generate", route_after_generate,
                         {"useful": END, "not_grounded": "generate", "not_useful": "web_search"})
 rag_app = g.compile()
 
-# ---------- FastAPI ----------
 api = FastAPI(title="Agentic RAG API")
 api.add_middleware(
     CORSMiddleware,
@@ -171,7 +165,7 @@ class ChatIn(BaseModel):
 
 @api.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
-    global document_loaded
+    global document_loaded, vectorstore, retriever
     suffix = os.path.splitext(file.filename)[1].lower()
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(await file.read())
@@ -187,7 +181,6 @@ async def upload_document(file: UploadFile = File(...)):
     chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150).split_documents(docs)
 
     reset_collection()
-    global vectorstore, retriever
     vectorstore = QdrantVectorStore(client=client, collection_name=COLLECTION_NAME, embedding=embeddings)
     vectorstore.add_documents(chunks)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
