@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Agentic RAG Chat</title>
+<style>
+  body { font-family: sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
+  #chat { border: 1px solid #ccc; padding: 10px; height: 350px; overflow-y: auto; margin-bottom: 10px; }
+  .msg { margin: 8px 0; }
+  .user { color: #2563eb; font-weight: bold; }
+  .bot { color: #16a34a; }
+  .steps { font-size: 12px; color: #888; }
+  input, button { padding: 8px; margin-top: 5px; }
+  input[type=text] { width: 70%; }
+  #uploadStatus { font-size: 13px; color: #666; margin-top: 5px; }
+</style>
+</head>
+<body>
+<h2>Agentic RAG Chat</h2>
+
+<div>
+  <input type="file" id="fileInput" />
+  <button onclick="uploadFile()">Upload Document</button>
+  <div id="uploadStatus"></div>
+</div>
+
+<hr>
+
+<div id="chat"></div>
+<input type="text" id="question" placeholder="Savolingizni yozing..." />
+<button onclick="send()">Yubor</button>
+
+<script>
+const API_URL = "https://agentic-rag-project-o0t3.onrender.com";
+
+async function uploadFile() {
+  const fileInput = document.getElementById("fileInput");
+  const file = fileInput.files[0];
+  if (!file) {
+    alert("Iltimos, avval fayl tanlang.");
+    return;
+  }
+  document.getElementById("uploadStatus").innerText = "Yuklanmoqda...";
+
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const res = await fetch(`${API_URL}/upload`, {
+    method: "POST",
+    body: formData
+  });
+  const data = await res.json();
+  document.getElementById("uploadStatus").innerText =
+    `✅ ${data.filename} yuklandi (${data.chunks} chunk)`;
+}
+
+async function send() {
+  const q = document.getElementById("question").value;
+  if (!q) return;
+  const chat = document.getElementById("chat");
+  chat.innerHTML += `<div class="msg user">Siz: ${q}</div>`;
+  document.getElementById("question").value = "";
+
+  const res = await fetch(`${API_URL}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question: q })
+  });
+  const data = await res.json();
+
+  chat.innerHTML += `<div class="msg bot">Agent: ${data.answer}</div>`;
+  chat.innerHTML += `<div class="steps">Bosqichlar: ${(data.steps || []).join(" → ")}</div>`;
+  chat.scrollTop = chat.scrollHeight;
+}
+</script>
+</body>
+</html>
