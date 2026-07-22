@@ -3,95 +3,43 @@ import tempfile
 from typing import List, TypedDict
 
 import fitz
-import base64
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 from langgraph.graph import StateGraph, END
 
-# ---------- Provider config ----------
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+# ─── DeepSeek API sozlamalari ───
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+if not DEEPSEEK_API_KEY:
+    raise RuntimeError("DEEPSEEK_API_KEY environment variable is not set.")
 
-if not OPENAI_API_KEY and not DEEPSEEK_API_KEY:
-    raise RuntimeError("Set at least one of OPENAI_API_KEY or DEEPSEEK_API_KEY.")
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 
-# NOTE: DeepSeek has no embeddings endpoint compatible with OpenAIEmbeddings.
-# - If OPENAI_API_KEY is set, embeddings use OpenAI's text-embedding-3-small (1536-dim).
-# - If it's NOT set (pure DeepSeek setup), embeddings fall back to a free, local
-#   FastEmbed model (BAAI/bge-small-en-v1.5, 384-dim) that runs on CPU, no key needed.
-current_provider = "openai" if OPENAI_API_KEY else "deepseek"
+# DeepSeek V4 Flash — matnli model
+llm = ChatOpenAI(
+    model="deepseek-v4-flash",
+    temperature=0,
+    api_key=DEEPSEEK_API_KEY,
+    base_url=DEEPSEEK_BASE_URL,
+)
 
-# Embedding dimension depends on which backend is actually used, so the Qdrant
-# collection has to be created with the matching size.
-EMBEDDING_DIM = 1536 if OPENAI_API_KEY else 384
+# DeepSeek embedding API yo'q, shuning uchun HuggingFace embeddings ishlatamiz
+# Model: sentence-transformers/all-MiniLM-L6-v2 (384 o'lchamli)
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
 
-def get_llm(temperature=0):
-    if current_provider == "openai":
-        return ChatOpenAI(model="gpt-4o-mini", temperature=temperature, api_key=OPENAI_API_KEY)
-    else:
-        return ChatOpenAI(
-            # deepseek-chat is being retired (2026/07/24) in favor of deepseek-v4-flash,
-            # which runs in non-thinking mode by default (matches old deepseek-chat behavior).
-            model="deepseek-v4-flash",
-            temperature=temperature,
-            api_key=DEEPSEEK_API_KEY,
-            base_url="https://api.deepseek.com/v1",
-        )
-
-def get_vision_llm():
-    # DeepSeek's chat model doesn't do vision; skip image captioning if there's no OpenAI key.
-    if OPENAI_API_KEY:
-        return ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
-    return None
-
-def get_embeddings():
-    if OPENAI_API_KEY:
-        return OpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY)
-    # Pure DeepSeek setup: no OpenAI key, no embeddings API from DeepSeek either.
-    # Use a local, free embedding model instead (requires: pip install fastembed).
-    from langchain_community.embeddings import FastEmbedEmbeddings
-    return FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-
-def switch_provider():
-    global current_provider
-    if current_provider == "openai" and DEEPSEEK_API_KEY:
-        current_provider = "deepseek"
-        print("Switched to DeepSeek (fallback).")
-        return True
-    if current_provider == "deepseek" and OPENAI_API_KEY:
-        current_provider = "openai"
-        print("Switched back to OpenAI.")
-        return True
-    return False
-
-def is_quota_error(e: Exception) -> bool:
-    msg = str(e).lower()
-    return "quota" in msg or "rate limit" in msg or "429" in msg or "insufficient" in msg
-
-def call_with_fallback(func):
-    try:
-        return func()
-    except Exception as e:
-        if is_quota_error(e) and switch_provider():
-            return func()
-        raise
-
-# ---------- Vector store ----------
 client = QdrantClient(location=":memory:")
 COLLECTION_NAME = "agentic_rag"
-
-vectorstore = None
-retriever = None
-document_loaded = False
 
 def reset_collection():
     try:
@@ -100,41 +48,30 @@ def reset_collection():
         pass
     client.create_collection(
         collection_name=COLLECTION_NAME,
-        vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
+        vectors_config=VectorParams(size=384, distance=Distance.COSINE),
     )
 
-def build_pipeline():
-    global vectorstore, retriever
-    reset_collection()
-    embeddings = get_embeddings()
-    vectorstore = QdrantVectorStore(client=client, collection_name=COLLECTION_NAME, embedding=embeddings)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+reset_collection()
+vectorstore = QdrantVectorStore(
+    client=client,
+    collection_name=COLLECTION_NAME,
+    embedding=embeddings
+)
+retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
-build_pipeline()
-
-# ---------- Ingestion helpers ----------
-def caption_image(image_bytes):
-    vision_llm = get_vision_llm()
-    if vision_llm is None:
-        return "[Image could not be captioned: no vision-capable API key available]"
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    msg = vision_llm.invoke([{"role": "user", "content": [
-        {"type": "text", "text": "Describe what is shown in this image, briefly."},
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
-    ]}])
-    return msg.content
+document_loaded = False
 
 def ingest_pdf(path: str, filename: str):
+    """PDF'dan faqat matn o'qiladi (DeepSeek V4 Flash rasm tushunmaydi)."""
     docs = []
     pdf = fitz.open(path)
     for page_num, page in enumerate(pdf):
         text = page.get_text()
         if text.strip():
-            docs.append(Document(page_content=text, metadata={"source": filename, "page": page_num}))
-        for img in page.get_images(full=True):
-            base_image = pdf.extract_image(img[0])
-            caption = caption_image(base_image["image"])
-            docs.append(Document(page_content=f"[Image] {caption}", metadata={"source": filename, "page": page_num}))
+            docs.append(Document(
+                page_content=text,
+                metadata={"source": filename, "page": page_num}
+            ))
     return docs
 
 def ingest_text(path: str, filename: str):
@@ -142,7 +79,6 @@ def ingest_text(path: str, filename: str):
         text = f.read()
     return [Document(page_content=text, metadata={"source": filename})]
 
-# ---------- Graph state ----------
 class GraphState(TypedDict):
     question: str
     documents: List[Document]
@@ -154,57 +90,36 @@ class GraphState(TypedDict):
 class YesNo(BaseModel):
     binary_score: str = Field(description="'yes' or 'no'")
 
-def grade_doc(document, question):
-    def _call():
-        llm = get_llm()
-        chain = ChatPromptTemplate.from_messages([
-            ("system", "You are grading whether a document chunk is relevant to a user's question. "
-                       "Judge by meaning, not language. If the chunk touches the topic even loosely, answer 'yes'. "
-                       "Only answer 'no' if the chunk is clearly about something unrelated."),
-            ("human", "Document: {document}\n\nQuestion: {question}")
-        ]) | llm.with_structured_output(YesNo)
-        return chain.invoke({"document": document, "question": question})
-    return call_with_fallback(_call)
+doc_grader = ChatPromptTemplate.from_messages([
+    ("system", "You are grading whether a document chunk is relevant to a user's question. "
+               "Judge by meaning, not language. If the chunk touches the topic even loosely, answer 'yes'. "
+               "Only answer 'no' if the chunk is clearly about something unrelated."),
+    ("human", "Document: {document}\n\nQuestion: {question}")
+]) | llm.with_structured_output(YesNo)
 
-def grade_hallucination(documents, generation):
-    def _call():
-        llm = get_llm()
-        chain = ChatPromptTemplate.from_messages([
-            ("system", "Is the answer grounded in the given documents? Answer 'yes' or 'no'."),
-            ("human", "Documents: {documents}\n\nAnswer: {generation}")
-        ]) | llm.with_structured_output(YesNo)
-        return chain.invoke({"documents": documents, "generation": generation})
-    return call_with_fallback(_call)
+hallucination_grader = ChatPromptTemplate.from_messages([
+    ("system", "Is the answer grounded in the given documents? Answer 'yes' or 'no'."),
+    ("human", "Documents: {documents}\n\nAnswer: {generation}")
+]) | llm.with_structured_output(YesNo)
 
-def grade_answer(question, generation):
-    def _call():
-        llm = get_llm()
-        chain = ChatPromptTemplate.from_messages([
-            ("system", "Does the answer directly address the question? Answer 'yes' or 'no'."),
-            ("human", "Question: {question}\n\nAnswer: {generation}")
-        ]) | llm.with_structured_output(YesNo)
-        return chain.invoke({"question": question, "generation": generation})
-    return call_with_fallback(_call)
+answer_grader = ChatPromptTemplate.from_messages([
+    ("system", "Does the answer directly address the question? Answer 'yes' or 'no'."),
+    ("human", "Question: {question}\n\nAnswer: {generation}")
+]) | llm.with_structured_output(YesNo)
 
-def generate_answer(question, context):
-    def _call():
-        llm = get_llm()
-        chain = ChatPromptTemplate.from_messages([
-            ("system", "Answer only based on the given documents. If the answer isn't in the documents, say: "
-                       "'I could not find an answer to this in the documents.'"),
-            ("human", "Question: {question}\n\nDocuments:\n{context}")
-        ]) | llm
-        return chain.invoke({"question": question, "context": context})
-    return call_with_fallback(_call)
+rag_chain = ChatPromptTemplate.from_messages([
+    ("system", "Answer only based on the given documents. If the answer isn't in the documents, say: "
+               "'I could not find an answer to this in the documents.'"),
+    ("human", "Question: {question}\n\nDocuments:\n{context}")
+]) | llm
 
-# ---------- Graph nodes ----------
 def retrieve(state):
     docs = retriever.invoke(state["question"])
     return {"documents": docs, "steps": state.get("steps", []) + ["retrieve"]}
 
 def grade_documents(state):
     filtered = [d for d in state["documents"]
-                if grade_doc(d.page_content, state["question"]).binary_score == "yes"]
+                if doc_grader.invoke({"document": d.page_content, "question": state["question"]}).binary_score == "yes"]
     return {"documents": filtered, "steps": state["steps"] + ["grade_documents"]}
 
 def web_search(state):
@@ -216,7 +131,7 @@ def generate(state):
                 "sources": [], "steps": state["steps"] + ["generate"],
                 "retries": state.get("retries", 0) + 1}
     context = "\n\n".join(d.page_content for d in state["documents"])
-    result = generate_answer(state["question"], context)
+    result = rag_chain.invoke({"question": state["question"], "context": context})
     sources = list({d.metadata.get("source", "document") for d in state["documents"]})
     return {"generation": result.content, "sources": sources,
             "steps": state["steps"] + ["generate"], "retries": state.get("retries", 0) + 1}
@@ -227,9 +142,9 @@ def route_after_grade(state):
 def route_after_generate(state):
     if state.get("retries", 0) >= 3 or not state["documents"]:
         return "useful"
-    if grade_hallucination(state["documents"], state["generation"]).binary_score == "no":
+    if hallucination_grader.invoke({"documents": state["documents"], "generation": state["generation"]}).binary_score == "no":
         return "not_grounded"
-    useful = grade_answer(state["question"], state["generation"]).binary_score
+    useful = answer_grader.invoke({"question": state["question"], "generation": state["generation"]}).binary_score
     return "useful" if useful == "yes" else "not_useful"
 
 g = StateGraph(GraphState)
@@ -245,8 +160,7 @@ g.add_conditional_edges("generate", route_after_generate,
                         {"useful": END, "not_grounded": "generate", "not_useful": "web_search"})
 rag_app = g.compile()
 
-# ---------- FastAPI ----------
-api = FastAPI(title="Agentic RAG API")
+api = FastAPI(title="Agentic RAG API (DeepSeek V4 Flash)")
 api.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -260,7 +174,7 @@ class ChatIn(BaseModel):
 
 @api.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
-    global document_loaded
+    global document_loaded, vectorstore, retriever
     suffix = os.path.splitext(file.filename)[1].lower()
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(await file.read())
@@ -275,11 +189,17 @@ async def upload_document(file: UploadFile = File(...)):
 
     chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150).split_documents(docs)
 
-    build_pipeline()
+    reset_collection()
+    vectorstore = QdrantVectorStore(
+        client=client,
+        collection_name=COLLECTION_NAME,
+        embedding=embeddings
+    )
     vectorstore.add_documents(chunks)
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
     document_loaded = True
 
-    return {"status": "ok", "filename": file.filename, "chunks": len(chunks), "current_provider": current_provider}
+    return {"status": "ok", "filename": file.filename, "chunks": len(chunks)}
 
 @api.post("/chat")
 def chat(body: ChatIn):
@@ -290,4 +210,4 @@ def chat(body: ChatIn):
 
 @api.get("/health")
 def health():
-    return {"status": "ok", "document_loaded": document_loaded, "current_provider": current_provider}
+    return {"status": "ok", "document_loaded": document_loaded}
