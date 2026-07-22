@@ -5,9 +5,9 @@ langgraph
 langchain
 langchain-community
 langchain-openai
-langchain-huggingface
 langchain-qdrant
+langchain-text-splitters
 qdrant-client
 pymupdf
 pydantic
-sentence-transformers
+fastembed
