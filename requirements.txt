@@ -6,7 +6,9 @@ langchain
 langchain-community
 langchain-openai
 langchain-qdrant
+langchain-text-splitters
 qdrant-client
 pymupdf
 pydantic
-
+fastembed
+ 
