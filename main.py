@@ -3,40 +3,46 @@ import tempfile
 from typing import List, TypedDict
 
 import fitz
+import base64
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 from langgraph.graph import StateGraph, END
 
-# ─── DeepSeek API sozlamalari ───
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # optional now: only used for embeddings/vision
 if not DEEPSEEK_API_KEY:
     raise RuntimeError("DEEPSEEK_API_KEY environment variable is not set.")
 
-DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-
-# DeepSeek V4 Flash — matnli model
+# Chat + grading now run on DeepSeek V4 Flash instead of OpenAI.
+# (deepseek-chat is retired 2026/07/24; deepseek-v4-flash is its replacement, non-thinking mode.)
 llm = ChatOpenAI(
     model="deepseek-v4-flash",
     temperature=0,
     api_key=DEEPSEEK_API_KEY,
-    base_url=DEEPSEEK_BASE_URL,
+    base_url="https://api.deepseek.com/v1",
 )
 
-# DeepSeek embedding API yo'q, shuning uchun HuggingFace embeddings ishlatamiz
-# Model: sentence-transformers/all-MiniLM-L6-v2 (384 o'lchamli)
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+# DeepSeek has no vision model, so image captioning only works if an OpenAI key is also set.
+vision_llm = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# DeepSeek has no embeddings endpoint either. Use OpenAI embeddings if that key is available,
+# otherwise fall back to a free local model (requires: pip install fastembed).
+if OPENAI_API_KEY:
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY)
+    EMBEDDING_DIM = 1536
+else:
+    from langchain_community.embeddings import FastEmbedEmbeddings
+    embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+    EMBEDDING_DIM = 384
 
 client = QdrantClient(location=":memory:")
 COLLECTION_NAME = "agentic_rag"
@@ -48,30 +54,36 @@ def reset_collection():
         pass
     client.create_collection(
         collection_name=COLLECTION_NAME,
-        vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+        vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
     )
 
 reset_collection()
-vectorstore = QdrantVectorStore(
-    client=client,
-    collection_name=COLLECTION_NAME,
-    embedding=embeddings
-)
+vectorstore = QdrantVectorStore(client=client, collection_name=COLLECTION_NAME, embedding=embeddings)
 retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
 document_loaded = False
 
+def caption_image(image_bytes):
+    if vision_llm is None:
+        return "[Image could not be captioned: no vision-capable API key available]"
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    msg = vision_llm.invoke([{"role": "user", "content": [
+        {"type": "text", "text": "Describe what is shown in this image, briefly."},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+    ]}])
+    return msg.content
+
 def ingest_pdf(path: str, filename: str):
-    """PDF'dan faqat matn o'qiladi (DeepSeek V4 Flash rasm tushunmaydi)."""
     docs = []
     pdf = fitz.open(path)
     for page_num, page in enumerate(pdf):
         text = page.get_text()
         if text.strip():
-            docs.append(Document(
-                page_content=text,
-                metadata={"source": filename, "page": page_num}
-            ))
+            docs.append(Document(page_content=text, metadata={"source": filename, "page": page_num}))
+        for img in page.get_images(full=True):
+            base_image = pdf.extract_image(img[0])
+            caption = caption_image(base_image["image"])
+            docs.append(Document(page_content=f"[Image] {caption}", metadata={"source": filename, "page": page_num}))
     return docs
 
 def ingest_text(path: str, filename: str):
@@ -160,7 +172,7 @@ g.add_conditional_edges("generate", route_after_generate,
                         {"useful": END, "not_grounded": "generate", "not_useful": "web_search"})
 rag_app = g.compile()
 
-api = FastAPI(title="Agentic RAG API (DeepSeek V4 Flash)")
+api = FastAPI(title="Agentic RAG API")
 api.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -190,11 +202,7 @@ async def upload_document(file: UploadFile = File(...)):
     chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150).split_documents(docs)
 
     reset_collection()
-    vectorstore = QdrantVectorStore(
-        client=client,
-        collection_name=COLLECTION_NAME,
-        embedding=embeddings
-    )
+    vectorstore = QdrantVectorStore(client=client, collection_name=COLLECTION_NAME, embedding=embeddings)
     vectorstore.add_documents(chunks)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
     document_loaded = True
