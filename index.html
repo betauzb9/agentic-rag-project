@@ -223,12 +223,16 @@ async function uploadFile() {
 
   try {
     const res = await fetch(`${API_URL}/upload`, { method: "POST", body: formData });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Server returned ${res.status}: ${text.slice(0, 200)}`);
+    }
     const data = await res.json();
     statusEl.style.color = "#16a34a";
     statusEl.innerText = `✅ ${data.filename} uploaded (${data.chunks} chunks)`;
   } catch (err) {
     statusEl.style.color = "#dc2626";
-    statusEl.innerText = "❌ Something went wrong. Please try again.";
+    statusEl.innerText = `❌ ${err.message || "Something went wrong. Please try again."}`;
   }
 }
 
@@ -260,6 +264,10 @@ async function send() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ question: q })
     });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Server returned ${res.status}: ${text.slice(0, 200)}`);
+    }
     const data = await res.json();
 
     loadingMsg.innerHTML = `
@@ -267,7 +275,7 @@ async function send() {
       <div class="steps">${(data.steps || []).join(" → ")}</div>
     `;
   } catch (err) {
-    loadingMsg.innerHTML = `<div class="bubble">❌ Something went wrong.</div>`;
+    loadingMsg.innerHTML = `<div class="bubble">❌ ${err.message || "Something went wrong."}</div>`;
   }
   chat.scrollTop = chat.scrollHeight;
 }
