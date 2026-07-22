@@ -1,17 +1,16 @@
 import os
 import tempfile
-from typing import List, TypedDict
+from typing import List, TypedDict, Optional, Any
 
 import fitz
 import base64
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI  # SDK class only; points at DeepSeek's endpoint below
 from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_qdrant import QdrantVectorStore
@@ -19,12 +18,12 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 from langgraph.graph import StateGraph, END
 
-# ─── DeepSeek API sozlamalari ───
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 if not DEEPSEEK_API_KEY:
     raise RuntimeError("DEEPSEEK_API_KEY environment variable is not set.")
 
-# Chat + grading uchun DeepSeek V4 Flash
+# Chat + grading run on DeepSeek V4 Flash.
+# (deepseek-chat is retired 2026/07/24; deepseek-v4-flash is its replacement, non-thinking mode.)
 llm = ChatOpenAI(
     model="deepseek-v4-flash",
     temperature=0,
@@ -32,45 +31,47 @@ llm = ChatOpenAI(
     base_url="https://api.deepseek.com/v1",
 )
 
-# DeepSeek vision model yo'q
+# DeepSeek has no vision model, so image captioning is disabled — PDFs still ingest fine,
+# embedded images just get a placeholder instead of a real caption.
 vision_llm = None
 
-# FastEmbed embeddings (lokal, API key kerak emas)
-# Model birinchi marta yuklanadi — bu biroz vaqt olishi mumkin
-try:
-    embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-    EMBEDDING_DIM = 384
-except Exception as e:
-    print(f"Warning: FastEmbed initialization failed: {e}")
-    # Fallback: oddiy so'z embedding (agar kerak bo'lsa)
-    raise
+# DeepSeek has no embeddings endpoint, so embeddings run on a free local model
+# (requires: pip install fastembed). No API key needed for this part.
+embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+EMBEDDING_DIM = 384
 
 client = QdrantClient(location=":memory:")
-COLLECTION_NAME = "agentic_rag"
 
-def reset_collection():
+# ---------- Per-session storage ----------
+# Each browser gets its own session_id (sent as the X-Session-Id header).
+# Every session has its own Qdrant collection + retriever, so uploads from
+# one user never overwrite or leak into another user's chat.
+SESSIONS: dict[str, dict] = {}
+
+def collection_name_for(session_id: str) -> str:
+    # Qdrant collection names are restricted to a safe charset; session_id is a UUID so this is safe.
+    return f"agentic_rag_{session_id}"
+
+def create_session_collection(session_id: str) -> str:
+    name = collection_name_for(session_id)
     try:
-        client.delete_collection(COLLECTION_NAME)
+        client.delete_collection(name)
     except Exception:
         pass
     client.create_collection(
-        collection_name=COLLECTION_NAME,
+        collection_name=name,
         vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
     )
+    return name
 
-reset_collection()
-vectorstore = QdrantVectorStore(
-    client=client,
-    collection_name=COLLECTION_NAME,
-    embedding=embeddings
-)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-
-document_loaded = False
+def get_session(session_id: str) -> dict:
+    if session_id not in SESSIONS:
+        SESSIONS[session_id] = {"retriever": None, "document_loaded": False}
+    return SESSIONS[session_id]
 
 def caption_image(image_bytes):
     if vision_llm is None:
-        return "[Image: vision model not available]"
+        return "[Image could not be captioned: no vision-capable API key available]"
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     msg = vision_llm.invoke([{"role": "user", "content": [
         {"type": "text", "text": "Describe what is shown in this image, briefly."},
@@ -84,20 +85,11 @@ def ingest_pdf(path: str, filename: str):
     for page_num, page in enumerate(pdf):
         text = page.get_text()
         if text.strip():
-            docs.append(Document(
-                page_content=text,
-                metadata={"source": filename, "page": page_num}
-            ))
+            docs.append(Document(page_content=text, metadata={"source": filename, "page": page_num}))
         for img in page.get_images(full=True):
-            try:
-                base_image = pdf.extract_image(img[0])
-                caption = caption_image(base_image["image"])
-                docs.append(Document(
-                    page_content=f"[Image] {caption}",
-                    metadata={"source": filename, "page": page_num}
-                ))
-            except Exception:
-                pass
+            base_image = pdf.extract_image(img[0])
+            caption = caption_image(base_image["image"])
+            docs.append(Document(page_content=f"[Image] {caption}", metadata={"source": filename, "page": page_num}))
     return docs
 
 def ingest_text(path: str, filename: str):
@@ -112,6 +104,7 @@ class GraphState(TypedDict):
     steps: List[str]
     sources: List[str]
     retries: int
+    retriever: Any  # session-specific retriever, injected per request
 
 class YesNo(BaseModel):
     binary_score: str = Field(description="'yes' or 'no'")
@@ -140,7 +133,7 @@ rag_chain = ChatPromptTemplate.from_messages([
 ]) | llm
 
 def retrieve(state):
-    docs = retriever.invoke(state["question"])
+    docs = state["retriever"].invoke(state["question"])
     return {"documents": docs, "steps": state.get("steps", []) + ["retrieve"]}
 
 def grade_documents(state):
@@ -186,11 +179,11 @@ g.add_conditional_edges("generate", route_after_generate,
                         {"useful": END, "not_grounded": "generate", "not_useful": "web_search"})
 rag_app = g.compile()
 
-api = FastAPI(title="Agentic RAG API (DeepSeek V4 Flash)")
+api = FastAPI(title="Agentic RAG API")
 api.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,  # no cookies/auth used; safe (and required) to combine with "*"
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -199,62 +192,48 @@ class ChatIn(BaseModel):
     question: str
 
 @api.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
-    global document_loaded, vectorstore, retriever
-    try:
-        suffix = os.path.splitext(file.filename)[1].lower()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(await file.read())
-            tmp_path = tmp.name
+async def upload_document(
+    file: UploadFile = File(...),
+    x_session_id: str = Header(..., alias="X-Session-Id"),
+):
+    session = get_session(x_session_id)
 
-        if suffix == ".pdf":
-            docs = ingest_pdf(tmp_path, file.filename)
-        else:
-            docs = ingest_text(tmp_path, file.filename)
+    suffix = os.path.splitext(file.filename)[1].lower()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
 
-        os.remove(tmp_path)
+    if suffix == ".pdf":
+        docs = ingest_pdf(tmp_path, file.filename)
+    else:
+        docs = ingest_text(tmp_path, file.filename)
 
-        chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150).split_documents(docs)
+    os.remove(tmp_path)
 
-        reset_collection()
-        vectorstore = QdrantVectorStore(
-            client=client,
-            collection_name=COLLECTION_NAME,
-            embedding=embeddings
-        )
-        vectorstore.add_documents(chunks)
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-        document_loaded = True
+    chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150).split_documents(docs)
 
-        return {"status": "ok", "filename": file.filename, "chunks": len(chunks)}
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)}
-        )
+    collection_name = create_session_collection(x_session_id)
+    vectorstore = QdrantVectorStore(client=client, collection_name=collection_name, embedding=embeddings)
+    vectorstore.add_documents(chunks)
+
+    session["retriever"] = vectorstore.as_retriever(search_kwargs={"k": 4})
+    session["document_loaded"] = True
+
+    return {"status": "ok", "filename": file.filename, "chunks": len(chunks)}
 
 @api.post("/chat")
-def chat(body: ChatIn):
-    if not document_loaded:
+def chat(body: ChatIn, x_session_id: str = Header(..., alias="X-Session-Id")):
+    session = get_session(x_session_id)
+    if not session["document_loaded"]:
         return {"answer": "Please upload a document first using /upload.", "steps": [], "sources": []}
-    try:
-        r = rag_app.invoke({"question": body.question, "steps": [], "retries": 0})
-        return {"answer": r["generation"], "steps": r["steps"], "sources": r["sources"]}
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"answer": f"Error: {str(e)}", "steps": ["error"], "sources": []}
-        )
+    r = rag_app.invoke({
+        "question": body.question,
+        "steps": [],
+        "retries": 0,
+        "retriever": session["retriever"],
+    })
+    return {"answer": r["generation"], "steps": r["steps"], "sources": r["sources"]}
 
 @api.get("/health")
 def health():
-    return {"status": "ok", "document_loaded": document_loaded}
-    from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-
-# Static fayllar (index.html, CSS, JS)
-api.mount("/static", StaticFiles(directory="static"), name="static")
-
-@app.get("/")
-def read_root():
-    return FileResponse("index.html")
+    return {"status": "ok", "active_sessions": len(SESSIONS)}
