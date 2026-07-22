@@ -11,3 +11,4 @@ qdrant-client
 pymupdf
 pydantic
 fastembed
+onnxruntime>=1.17.0
