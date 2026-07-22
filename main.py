@@ -1,17 +1,16 @@
 import os
 import tempfile
-from typing import List, TypedDict, Optional, Any
+from typing import List, TypedDict
 
 import fitz
 import base64
-from fastapi import FastAPI, UploadFile, File, Header
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI  # SDK class only; points at DeepSeek's endpoint below
-from langchain_community.embeddings import FastEmbedEmbeddings
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
@@ -22,56 +21,30 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 if not DEEPSEEK_API_KEY:
     raise RuntimeError("DEEPSEEK_API_KEY environment variable is not set.")
 
-# Chat + grading run on DeepSeek V4 Flash.
-# (deepseek-chat is retired 2026/07/24; deepseek-v4-flash is its replacement, non-thinking mode.)
-llm = ChatOpenAI(
-    model="deepseek-v4-flash",
-    temperature=0,
-    api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com/v1",
-)
-
-# DeepSeek has no vision model, so image captioning is disabled — PDFs still ingest fine,
-# embedded images just get a placeholder instead of a real caption.
-vision_llm = None
-
-# DeepSeek has no embeddings endpoint, so embeddings run on a free local model
-# (requires: pip install fastembed). No API key needed for this part.
-embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-EMBEDDING_DIM = 384
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+vision_llm = ChatOpenAI(model="gpt-4o-mini")
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
 client = QdrantClient(location=":memory:")
+COLLECTION_NAME = "agentic_rag"
 
-# ---------- Per-session storage ----------
-# Each browser gets its own session_id (sent as the X-Session-Id header).
-# Every session has its own Qdrant collection + retriever, so uploads from
-# one user never overwrite or leak into another user's chat.
-SESSIONS: dict[str, dict] = {}
-
-def collection_name_for(session_id: str) -> str:
-    # Qdrant collection names are restricted to a safe charset; session_id is a UUID so this is safe.
-    return f"agentic_rag_{session_id}"
-
-def create_session_collection(session_id: str) -> str:
-    name = collection_name_for(session_id)
+def reset_collection():
     try:
-        client.delete_collection(name)
+        client.delete_collection(COLLECTION_NAME)
     except Exception:
         pass
     client.create_collection(
-        collection_name=name,
-        vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
+        collection_name=COLLECTION_NAME,
+        vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
     )
-    return name
 
-def get_session(session_id: str) -> dict:
-    if session_id not in SESSIONS:
-        SESSIONS[session_id] = {"retriever": None, "document_loaded": False}
-    return SESSIONS[session_id]
+reset_collection()
+vectorstore = QdrantVectorStore(client=client, collection_name=COLLECTION_NAME, embedding=embeddings)
+retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+
+document_loaded = False
 
 def caption_image(image_bytes):
-    if vision_llm is None:
-        return "[Image could not be captioned: no vision-capable API key available]"
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     msg = vision_llm.invoke([{"role": "user", "content": [
         {"type": "text", "text": "Describe what is shown in this image, briefly."},
@@ -104,7 +77,6 @@ class GraphState(TypedDict):
     steps: List[str]
     sources: List[str]
     retries: int
-    retriever: Any  # session-specific retriever, injected per request
 
 class YesNo(BaseModel):
     binary_score: str = Field(description="'yes' or 'no'")
@@ -133,7 +105,7 @@ rag_chain = ChatPromptTemplate.from_messages([
 ]) | llm
 
 def retrieve(state):
-    docs = state["retriever"].invoke(state["question"])
+    docs = retriever.invoke(state["question"])
     return {"documents": docs, "steps": state.get("steps", []) + ["retrieve"]}
 
 def grade_documents(state):
@@ -183,7 +155,7 @@ api = FastAPI(title="Agentic RAG API")
 api.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,  # no cookies/auth used; safe (and required) to combine with "*"
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -192,12 +164,8 @@ class ChatIn(BaseModel):
     question: str
 
 @api.post("/upload")
-async def upload_document(
-    file: UploadFile = File(...),
-    x_session_id: str = Header(..., alias="X-Session-Id"),
-):
-    session = get_session(x_session_id)
-
+async def upload_document(file: UploadFile = File(...)):
+    global document_loaded, vectorstore, retriever
     suffix = os.path.splitext(file.filename)[1].lower()
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(await file.read())
@@ -212,28 +180,21 @@ async def upload_document(
 
     chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150).split_documents(docs)
 
-    collection_name = create_session_collection(x_session_id)
-    vectorstore = QdrantVectorStore(client=client, collection_name=collection_name, embedding=embeddings)
+    reset_collection()
+    vectorstore = QdrantVectorStore(client=client, collection_name=COLLECTION_NAME, embedding=embeddings)
     vectorstore.add_documents(chunks)
-
-    session["retriever"] = vectorstore.as_retriever(search_kwargs={"k": 4})
-    session["document_loaded"] = True
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+    document_loaded = True
 
     return {"status": "ok", "filename": file.filename, "chunks": len(chunks)}
 
 @api.post("/chat")
-def chat(body: ChatIn, x_session_id: str = Header(..., alias="X-Session-Id")):
-    session = get_session(x_session_id)
-    if not session["document_loaded"]:
+def chat(body: ChatIn):
+    if not document_loaded:
         return {"answer": "Please upload a document first using /upload.", "steps": [], "sources": []}
-    r = rag_app.invoke({
-        "question": body.question,
-        "steps": [],
-        "retries": 0,
-        "retriever": session["retriever"],
-    })
+    r = rag_app.invoke({"question": body.question, "steps": [], "retries": 0})
     return {"answer": r["generation"], "steps": r["steps"], "sources": r["sources"]}
 
 @api.get("/health")
 def health():
-    return {"status": "ok", "active_sessions": len(SESSIONS)}
+    return {"status": "ok", "document_loaded": document_loaded}
