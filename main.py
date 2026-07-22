@@ -1,9 +1,7 @@
 import os
-import tempfile
 from typing import List, TypedDict
 
-import fitz
-import base64
+import openai
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -17,184 +15,69 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 from langgraph.graph import StateGraph, END
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
+# ---------- Multiple API keys with fallback ----------
+API_KEYS = [
+    os.environ.get("OPENAI_API_KEY"),
+    os.environ.get("OPENAI_API_KEY_2"),
+    os.environ.get("OPENAI_API_KEY_3"),
+]
+API_KEYS = [k for k in API_KEYS if k]  # remove empty ones
 
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-vision_llm = ChatOpenAI(model="gpt-4o-mini")
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+if not API_KEYS:
+    raise RuntimeError("No OPENAI_API_KEY environment variables are set.")
 
-client = QdrantClient(location=":memory:")
-COLLECTION_NAME = "agentic_rag"
+current_key_index = 0
 
-def reset_collection():
-    try:
-        client.delete_collection(COLLECTION_NAME)
-    except Exception:
-        pass
-    client.create_collection(
-        collection_name=COLLECTION_NAME,
-        vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
-    )
+def get_working_llm(model="gpt-4o-mini", temperature=0):
+    """Returns an LLM instance using the current working API key."""
+    global current_key_index
+    key = API_KEYS[current_key_index]
+    return ChatOpenAI(model=model, temperature=temperature, api_key=key)
 
-reset_collection()
-vectorstore = QdrantVectorStore(client=client, collection_name=COLLECTION_NAME, embedding=embeddings)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+def get_working_embeddings():
+    global current_key_index
+    key = API_KEYS[current_key_index]
+    return OpenAIEmbeddings(model="text-embedding-3-small", api_key=key)
 
-document_loaded = False
+def switch_to_next_key():
+    """Switches to the next available API key. Returns True if switched, False if no more keys."""
+    global current_key_index
+    if current_key_index + 1 < len(API_KEYS):
+        current_key_index += 1
+        print(f"Switching to backup API key #{current_key_index + 1}")
+        return True
+    return False
 
-def caption_image(image_bytes):
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    msg = vision_llm.invoke([{"role": "user", "content": [
-        {"type": "text", "text": "Describe what is shown in this image, briefly."},
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
-    ]}])
-    return msg.content
-
-def ingest_pdf(path: str, filename: str):
-    docs = []
-    pdf = fitz.open(path)
-    for page_num, page in enumerate(pdf):
-        text = page.get_text()
-        if text.strip():
-            docs.append(Document(page_content=text, metadata={"source": filename, "page": page_num}))
-        for img in page.get_images(full=True):
-            base_image = pdf.extract_image(img[0])
-            caption = caption_image(base_image["image"])
-            docs.append(Document(page_content=f"[Image] {caption}", metadata={"source": filename, "page": page_num}))
-    return docs
-
-def ingest_text(path: str, filename: str):
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        text = f.read()
-    return [Document(page_content=text, metadata={"source": filename})]
-
-class GraphState(TypedDict):
-    question: str
-    documents: List[Document]
-    generation: str
-    steps: List[str]
-    sources: List[str]
-    retries: int
-
-class YesNo(BaseModel):
-    binary_score: str = Field(description="'yes' or 'no'")
-
-doc_grader = ChatPromptTemplate.from_messages([
-    ("system", "You are grading whether a document chunk is relevant to a user's question. "
-               "Judge by meaning, not language. If the chunk touches the topic even loosely, answer 'yes'. "
-               "Only answer 'no' if the chunk is clearly about something unrelated."),
-    ("human", "Document: {document}\n\nQuestion: {question}")
-]) | llm.with_structured_output(YesNo)
-
-hallucination_grader = ChatPromptTemplate.from_messages([
-    ("system", "Is the answer grounded in the given documents? Answer 'yes' or 'no'."),
-    ("human", "Documents: {documents}\n\nAnswer: {generation}")
-]) | llm.with_structured_output(YesNo)
-
-answer_grader = ChatPromptTemplate.from_messages([
-    ("system", "Does the answer directly address the question? Answer 'yes' or 'no'."),
-    ("human", "Question: {question}\n\nAnswer: {generation}")
-]) | llm.with_structured_output(YesNo)
-
-rag_chain = ChatPromptTemplate.from_messages([
-    ("system", "Answer only based on the given documents. If the answer isn't in the documents, say: "
-               "'I could not find an answer to this in the documents.'"),
-    ("human", "Question: {question}\n\nDocuments:\n{context}")
-]) | llm
-
-def retrieve(state):
-    docs = retriever.invoke(state["question"])
-    return {"documents": docs, "steps": state.get("steps", []) + ["retrieve"]}
-
-def grade_documents(state):
-    filtered = [d for d in state["documents"]
-                if doc_grader.invoke({"document": d.page_content, "question": state["question"]}).binary_score == "yes"]
-    return {"documents": filtered, "steps": state["steps"] + ["grade_documents"]}
-
-def web_search(state):
-    return {"documents": state["documents"], "steps": state["steps"] + ["web_search_skipped"]}
-
-def generate(state):
+def call_with_fallback(func, *args, **kwargs):
+    """Calls func(*args, **kwargs); on quota/rate-limit error, retries with next key."""
+    global current_key_index
+    attempts = 0
+    while attempts < len(API_KEYS):
+        try:
+            return func(*args, **kwargs)
+        except openai.RateLimitError as e:
+            print(f"API key #{current_key_index + 1} failed: {e}")
+            if not switch_to_next_key():
+                raise RuntimeError("All API keys exhausted their quota.") from e
+            attempts += 1
+    raise RuntimeError("All API keys failed.")
+    def generate(state):
     if not state["documents"]:
         return {"generation": "I could not find an answer to this in the documents.",
                 "sources": [], "steps": state["steps"] + ["generate"],
                 "retries": state.get("retries", 0) + 1}
     context = "\n\n".join(d.page_content for d in state["documents"])
-    result = rag_chain.invoke({"question": state["question"], "context": context})
+    
+    def _call():
+        llm = get_working_llm()
+        chain = ChatPromptTemplate.from_messages([
+            ("system", "Answer only based on the given documents. If the answer isn't in the documents, say: "
+                       "'I could not find an answer to this in the documents.'"),
+            ("human", "Question: {question}\n\nDocuments:\n{context}")
+        ]) | llm
+        return chain.invoke({"question": state["question"], "context": context})
+    
+    result = call_with_fallback(_call)
     sources = list({d.metadata.get("source", "document") for d in state["documents"]})
     return {"generation": result.content, "sources": sources,
             "steps": state["steps"] + ["generate"], "retries": state.get("retries", 0) + 1}
-
-def route_after_grade(state):
-    return "generate" if state["documents"] else "web_search"
-
-def route_after_generate(state):
-    if state.get("retries", 0) >= 3 or not state["documents"]:
-        return "useful"
-    if hallucination_grader.invoke({"documents": state["documents"], "generation": state["generation"]}).binary_score == "no":
-        return "not_grounded"
-    useful = answer_grader.invoke({"question": state["question"], "generation": state["generation"]}).binary_score
-    return "useful" if useful == "yes" else "not_useful"
-
-g = StateGraph(GraphState)
-g.add_node("retrieve", retrieve)
-g.add_node("grade_documents", grade_documents)
-g.add_node("web_search", web_search)
-g.add_node("generate", generate)
-g.set_entry_point("retrieve")
-g.add_edge("retrieve", "grade_documents")
-g.add_conditional_edges("grade_documents", route_after_grade, {"web_search": "web_search", "generate": "generate"})
-g.add_edge("web_search", "generate")
-g.add_conditional_edges("generate", route_after_generate,
-                        {"useful": END, "not_grounded": "generate", "not_useful": "web_search"})
-rag_app = g.compile()
-
-api = FastAPI(title="Agentic RAG API")
-api.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class ChatIn(BaseModel):
-    question: str
-
-@api.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
-    global document_loaded, vectorstore, retriever
-    suffix = os.path.splitext(file.filename)[1].lower()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
-
-    if suffix == ".pdf":
-        docs = ingest_pdf(tmp_path, file.filename)
-    else:
-        docs = ingest_text(tmp_path, file.filename)
-
-    os.remove(tmp_path)
-
-    chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150).split_documents(docs)
-
-    reset_collection()
-    vectorstore = QdrantVectorStore(client=client, collection_name=COLLECTION_NAME, embedding=embeddings)
-    vectorstore.add_documents(chunks)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-    document_loaded = True
-
-    return {"status": "ok", "filename": file.filename, "chunks": len(chunks)}
-
-@api.post("/chat")
-def chat(body: ChatIn):
-    if not document_loaded:
-        return {"answer": "Please upload a document first using /upload.", "steps": [], "sources": []}
-    r = rag_app.invoke({"question": body.question, "steps": [], "retries": 0})
-    return {"answer": r["generation"], "steps": r["steps"], "sources": r["sources"]}
-
-@api.get("/health")
-def health():
-    return {"status": "ok", "document_loaded": document_loaded}
