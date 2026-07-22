@@ -17,16 +17,71 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 from langgraph.graph import StateGraph, END
 
+# ---------- Provider config ----------
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-vision_llm = ChatOpenAI(model="gpt-4o-mini")
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+if not OPENAI_API_KEY and not DEEPSEEK_API_KEY:
+    raise RuntimeError("Set at least one of OPENAI_API_KEY or DEEPSEEK_API_KEY.")
 
+# NOTE: DeepSeek has no embeddings endpoint compatible with OpenAIEmbeddings,
+# so embeddings always use OpenAI if available. DeepSeek is only used for
+# chat/generation as a fallback when OpenAI's LLM calls fail.
+current_provider = "openai" if OPENAI_API_KEY else "deepseek"
+
+def get_llm(temperature=0):
+    if current_provider == "openai":
+        return ChatOpenAI(model="gpt-4o-mini", temperature=temperature, api_key=OPENAI_API_KEY)
+    else:
+        return ChatOpenAI(
+            model="deepseek-chat",
+            temperature=temperature,
+            api_key=DEEPSEEK_API_KEY,
+            base_url="https://api.deepseek.com/v1",
+        )
+
+def get_vision_llm():
+    # DeepSeek doesn't support vision; fall back to OpenAI if available, else skip captioning
+    if OPENAI_API_KEY:
+        return ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
+    return None
+
+def get_embeddings():
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Embeddings require OPENAI_API_KEY (DeepSeek has no embeddings endpoint).")
+    return OpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY)
+
+def switch_provider():
+    global current_provider
+    if current_provider == "openai" and DEEPSEEK_API_KEY:
+        current_provider = "deepseek"
+        print("Switched to DeepSeek (fallback).")
+        return True
+    if current_provider == "deepseek" and OPENAI_API_KEY:
+        current_provider = "openai"
+        print("Switched back to OpenAI.")
+        return True
+    return False
+
+def is_quota_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return "quota" in msg or "rate limit" in msg or "429" in msg or "insufficient" in msg
+
+def call_with_fallback(func):
+    try:
+        return func()
+    except Exception as e:
+        if is_quota_error(e) and switch_provider():
+            return func()
+        raise
+
+# ---------- Vector store (always OpenAI embeddings, dimension 1536) ----------
 client = QdrantClient(location=":memory:")
 COLLECTION_NAME = "agentic_rag"
+
+vectorstore = None
+retriever = None
+document_loaded = False
 
 def reset_collection():
     try:
@@ -38,13 +93,20 @@ def reset_collection():
         vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
     )
 
-reset_collection()
-vectorstore = QdrantVectorStore(client=client, collection_name=COLLECTION_NAME, embedding=embeddings)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+def build_pipeline():
+    global vectorstore, retriever
+    reset_collection()
+    embeddings = get_embeddings()
+    vectorstore = QdrantVectorStore(client=client, collection_name=COLLECTION_NAME, embedding=embeddings)
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
-document_loaded = False
+build_pipeline()
 
+# ---------- Ingestion helpers ----------
 def caption_image(image_bytes):
+    vision_llm = get_vision_llm()
+    if vision_llm is None:
+        return "[Image could not be captioned: no vision-capable API key available]"
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     msg = vision_llm.invoke([{"role": "user", "content": [
         {"type": "text", "text": "Describe what is shown in this image, briefly."},
@@ -70,6 +132,7 @@ def ingest_text(path: str, filename: str):
         text = f.read()
     return [Document(page_content=text, metadata={"source": filename})]
 
+# ---------- Graph state ----------
 class GraphState(TypedDict):
     question: str
     documents: List[Document]
@@ -81,36 +144,57 @@ class GraphState(TypedDict):
 class YesNo(BaseModel):
     binary_score: str = Field(description="'yes' or 'no'")
 
-doc_grader = ChatPromptTemplate.from_messages([
-    ("system", "You are grading whether a document chunk is relevant to a user's question. "
-               "Judge by meaning, not language. If the chunk touches the topic even loosely, answer 'yes'. "
-               "Only answer 'no' if the chunk is clearly about something unrelated."),
-    ("human", "Document: {document}\n\nQuestion: {question}")
-]) | llm.with_structured_output(YesNo)
+def grade_doc(document, question):
+    def _call():
+        llm = get_llm()
+        chain = ChatPromptTemplate.from_messages([
+            ("system", "You are grading whether a document chunk is relevant to a user's question. "
+                       "Judge by meaning, not language. If the chunk touches the topic even loosely, answer 'yes'. "
+                       "Only answer 'no' if the chunk is clearly about something unrelated."),
+            ("human", "Document: {document}\n\nQuestion: {question}")
+        ]) | llm.with_structured_output(YesNo)
+        return chain.invoke({"document": document, "question": question})
+    return call_with_fallback(_call)
 
-hallucination_grader = ChatPromptTemplate.from_messages([
-    ("system", "Is the answer grounded in the given documents? Answer 'yes' or 'no'."),
-    ("human", "Documents: {documents}\n\nAnswer: {generation}")
-]) | llm.with_structured_output(YesNo)
+def grade_hallucination(documents, generation):
+    def _call():
+        llm = get_llm()
+        chain = ChatPromptTemplate.from_messages([
+            ("system", "Is the answer grounded in the given documents? Answer 'yes' or 'no'."),
+            ("human", "Documents: {documents}\n\nAnswer: {generation}")
+        ]) | llm.with_structured_output(YesNo)
+        return chain.invoke({"documents": documents, "generation": generation})
+    return call_with_fallback(_call)
 
-answer_grader = ChatPromptTemplate.from_messages([
-    ("system", "Does the answer directly address the question? Answer 'yes' or 'no'."),
-    ("human", "Question: {question}\n\nAnswer: {generation}")
-]) | llm.with_structured_output(YesNo)
+def grade_answer(question, generation):
+    def _call():
+        llm = get_llm()
+        chain = ChatPromptTemplate.from_messages([
+            ("system", "Does the answer directly address the question? Answer 'yes' or 'no'."),
+            ("human", "Question: {question}\n\nAnswer: {generation}")
+        ]) | llm.with_structured_output(YesNo)
+        return chain.invoke({"question": question, "generation": generation})
+    return call_with_fallback(_call)
 
-rag_chain = ChatPromptTemplate.from_messages([
-    ("system", "Answer only based on the given documents. If the answer isn't in the documents, say: "
-               "'I could not find an answer to this in the documents.'"),
-    ("human", "Question: {question}\n\nDocuments:\n{context}")
-]) | llm
+def generate_answer(question, context):
+    def _call():
+        llm = get_llm()
+        chain = ChatPromptTemplate.from_messages([
+            ("system", "Answer only based on the given documents. If the answer isn't in the documents, say: "
+                       "'I could not find an answer to this in the documents.'"),
+            ("human", "Question: {question}\n\nDocuments:\n{context}")
+        ]) | llm
+        return chain.invoke({"question": question, "context": context})
+    return call_with_fallback(_call)
 
+# ---------- Graph nodes ----------
 def retrieve(state):
     docs = retriever.invoke(state["question"])
     return {"documents": docs, "steps": state.get("steps", []) + ["retrieve"]}
 
 def grade_documents(state):
     filtered = [d for d in state["documents"]
-                if doc_grader.invoke({"document": d.page_content, "question": state["question"]}).binary_score == "yes"]
+                if grade_doc(d.page_content, state["question"]).binary_score == "yes"]
     return {"documents": filtered, "steps": state["steps"] + ["grade_documents"]}
 
 def web_search(state):
@@ -122,7 +206,7 @@ def generate(state):
                 "sources": [], "steps": state["steps"] + ["generate"],
                 "retries": state.get("retries", 0) + 1}
     context = "\n\n".join(d.page_content for d in state["documents"])
-    result = rag_chain.invoke({"question": state["question"], "context": context})
+    result = generate_answer(state["question"], context)
     sources = list({d.metadata.get("source", "document") for d in state["documents"]})
     return {"generation": result.content, "sources": sources,
             "steps": state["steps"] + ["generate"], "retries": state.get("retries", 0) + 1}
@@ -133,9 +217,9 @@ def route_after_grade(state):
 def route_after_generate(state):
     if state.get("retries", 0) >= 3 or not state["documents"]:
         return "useful"
-    if hallucination_grader.invoke({"documents": state["documents"], "generation": state["generation"]}).binary_score == "no":
+    if grade_hallucination(state["documents"], state["generation"]).binary_score == "no":
         return "not_grounded"
-    useful = answer_grader.invoke({"question": state["question"], "generation": state["generation"]}).binary_score
+    useful = grade_answer(state["question"], state["generation"]).binary_score
     return "useful" if useful == "yes" else "not_useful"
 
 g = StateGraph(GraphState)
@@ -151,6 +235,7 @@ g.add_conditional_edges("generate", route_after_generate,
                         {"useful": END, "not_grounded": "generate", "not_useful": "web_search"})
 rag_app = g.compile()
 
+# ---------- FastAPI ----------
 api = FastAPI(title="Agentic RAG API")
 api.add_middleware(
     CORSMiddleware,
@@ -165,7 +250,7 @@ class ChatIn(BaseModel):
 
 @api.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
-    global document_loaded, vectorstore, retriever
+    global document_loaded
     suffix = os.path.splitext(file.filename)[1].lower()
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(await file.read())
@@ -180,13 +265,11 @@ async def upload_document(file: UploadFile = File(...)):
 
     chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150).split_documents(docs)
 
-    reset_collection()
-    vectorstore = QdrantVectorStore(client=client, collection_name=COLLECTION_NAME, embedding=embeddings)
+    build_pipeline()
     vectorstore.add_documents(chunks)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
     document_loaded = True
 
-    return {"status": "ok", "filename": file.filename, "chunks": len(chunks)}
+    return {"status": "ok", "filename": file.filename, "chunks": len(chunks), "current_provider": current_provider}
 
 @api.post("/chat")
 def chat(body: ChatIn):
@@ -197,4 +280,4 @@ def chat(body: ChatIn):
 
 @api.get("/health")
 def health():
-    return {"status": "ok", "document_loaded": document_loaded}
+    return {"status": "ok", "document_loaded": document_loaded, "current_provider": current_provider}
