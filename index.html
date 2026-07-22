@@ -222,17 +222,23 @@ async function uploadFile() {
   formData.append("file", file);
 
   try {
-    const res = await fetch(`${API_URL}/upload`, { method: "POST", body: formData });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Server returned ${res.status}: ${text.slice(0, 200)}`);
-    }
+    const res = await fetch(`${API_URL}/upload`, { 
+      method: "POST", 
+      body: formData 
+    });
+    
     const data = await res.json();
+    
+    if (!res.ok) {
+      throw new Error(data.message || `Server returned ${res.status}`);
+    }
+    
     statusEl.style.color = "#16a34a";
     statusEl.innerText = `✅ ${data.filename} uploaded (${data.chunks} chunks)`;
   } catch (err) {
     statusEl.style.color = "#dc2626";
     statusEl.innerText = `❌ ${err.message || "Something went wrong. Please try again."}`;
+    console.error("Upload error:", err);
   }
 }
 
@@ -264,11 +270,12 @@ async function send() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ question: q })
     });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Server returned ${res.status}: ${text.slice(0, 200)}`);
-    }
+    
     const data = await res.json();
+    
+    if (!res.ok) {
+      throw new Error(data.message || `Server returned ${res.status}`);
+    }
 
     loadingMsg.innerHTML = `
       <div class="bubble">${data.answer}</div>
@@ -276,6 +283,7 @@ async function send() {
     `;
   } catch (err) {
     loadingMsg.innerHTML = `<div class="bubble">❌ ${err.message || "Something went wrong."}</div>`;
+    console.error("Chat error:", err);
   }
   chat.scrollTop = chat.scrollHeight;
 }
