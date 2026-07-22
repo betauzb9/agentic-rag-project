@@ -10,7 +10,8 @@ from pydantic import BaseModel, Field
 
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_openai import ChatOpenAI  # SDK class only; points at DeepSeek's endpoint below
+from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
@@ -18,11 +19,10 @@ from qdrant_client.models import Distance, VectorParams
 from langgraph.graph import StateGraph, END
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # optional now: only used for embeddings/vision
 if not DEEPSEEK_API_KEY:
     raise RuntimeError("DEEPSEEK_API_KEY environment variable is not set.")
 
-# Chat + grading now run on DeepSeek V4 Flash instead of OpenAI.
+# Chat + grading run on DeepSeek V4 Flash.
 # (deepseek-chat is retired 2026/07/24; deepseek-v4-flash is its replacement, non-thinking mode.)
 llm = ChatOpenAI(
     model="deepseek-v4-flash",
@@ -31,18 +31,14 @@ llm = ChatOpenAI(
     base_url="https://api.deepseek.com/v1",
 )
 
-# DeepSeek has no vision model, so image captioning only works if an OpenAI key is also set.
-vision_llm = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# DeepSeek has no vision model, so image captioning is disabled — PDFs still ingest fine,
+# embedded images just get a placeholder instead of a real caption.
+vision_llm = None
 
-# DeepSeek has no embeddings endpoint either. Use OpenAI embeddings if that key is available,
-# otherwise fall back to a free local model (requires: pip install fastembed).
-if OPENAI_API_KEY:
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY)
-    EMBEDDING_DIM = 1536
-else:
-    from langchain_community.embeddings import FastEmbedEmbeddings
-    embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-    EMBEDDING_DIM = 384
+# DeepSeek has no embeddings endpoint, so embeddings run on a free local model
+# (requires: pip install fastembed). No API key needed for this part.
+embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+EMBEDDING_DIM = 384
 
 client = QdrantClient(location=":memory:")
 COLLECTION_NAME = "agentic_rag"
