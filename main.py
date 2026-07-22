@@ -21,12 +21,11 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 if not DEEPSEEK_API_KEY:
     raise RuntimeError("DEEPSEEK_API_KEY environment variable is not set.")
 
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-vision_llm = ChatOpenAI(model="gpt-4o-mini")
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-
-client = QdrantClient(location=":memory:")
-COLLECTION_NAME = "agentic_rag"
+llm = DEEPSEEK_MODEL
+vision_llm = DEEPSEEK_API_KEY
+base_url="https://api.deepseek.com",
+    temperature=0,
+vision_llm = llm
 
 def reset_collection():
     try:
