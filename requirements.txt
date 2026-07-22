@@ -9,4 +9,4 @@ langchain-qdrant
 qdrant-client
 pymupdf
 pydantic
-langchain-google-genai
+
