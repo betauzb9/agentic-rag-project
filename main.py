@@ -24,32 +24,42 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 if not OPENAI_API_KEY and not DEEPSEEK_API_KEY:
     raise RuntimeError("Set at least one of OPENAI_API_KEY or DEEPSEEK_API_KEY.")
 
-# NOTE: DeepSeek has no embeddings endpoint compatible with OpenAIEmbeddings,
-# so embeddings always use OpenAI if available. DeepSeek is only used for
-# chat/generation as a fallback when OpenAI's LLM calls fail.
+# NOTE: DeepSeek has no embeddings endpoint compatible with OpenAIEmbeddings.
+# - If OPENAI_API_KEY is set, embeddings use OpenAI's text-embedding-3-small (1536-dim).
+# - If it's NOT set (pure DeepSeek setup), embeddings fall back to a free, local
+#   FastEmbed model (BAAI/bge-small-en-v1.5, 384-dim) that runs on CPU, no key needed.
 current_provider = "openai" if OPENAI_API_KEY else "deepseek"
+
+# Embedding dimension depends on which backend is actually used, so the Qdrant
+# collection has to be created with the matching size.
+EMBEDDING_DIM = 1536 if OPENAI_API_KEY else 384
 
 def get_llm(temperature=0):
     if current_provider == "openai":
         return ChatOpenAI(model="gpt-4o-mini", temperature=temperature, api_key=OPENAI_API_KEY)
     else:
         return ChatOpenAI(
-            model="deepseek-chat",
+            # deepseek-chat is being retired (2026/07/24) in favor of deepseek-v4-flash,
+            # which runs in non-thinking mode by default (matches old deepseek-chat behavior).
+            model="deepseek-v4-flash",
             temperature=temperature,
             api_key=DEEPSEEK_API_KEY,
             base_url="https://api.deepseek.com/v1",
         )
 
 def get_vision_llm():
-    # DeepSeek doesn't support vision; fall back to OpenAI if available, else skip captioning
+    # DeepSeek's chat model doesn't do vision; skip image captioning if there's no OpenAI key.
     if OPENAI_API_KEY:
         return ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
     return None
 
 def get_embeddings():
-    if not OPENAI_API_KEY:
-        raise RuntimeError("Embeddings require OPENAI_API_KEY (DeepSeek has no embeddings endpoint).")
-    return OpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY)
+    if OPENAI_API_KEY:
+        return OpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY)
+    # Pure DeepSeek setup: no OpenAI key, no embeddings API from DeepSeek either.
+    # Use a local, free embedding model instead (requires: pip install fastembed).
+    from langchain_community.embeddings import FastEmbedEmbeddings
+    return FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 
 def switch_provider():
     global current_provider
@@ -75,7 +85,7 @@ def call_with_fallback(func):
             return func()
         raise
 
-# ---------- Vector store (always OpenAI embeddings, dimension 1536) ----------
+# ---------- Vector store ----------
 client = QdrantClient(location=":memory:")
 COLLECTION_NAME = "agentic_rag"
 
@@ -90,7 +100,7 @@ def reset_collection():
         pass
     client.create_collection(
         collection_name=COLLECTION_NAME,
-        vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+        vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
     )
 
 def build_pipeline():
