@@ -249,3 +249,12 @@ def chat(body: ChatIn):
 @api.get("/health")
 def health():
     return {"status": "ok", "document_loaded": document_loaded}
+    from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+# Static fayllar (index.html, CSS, JS)
+api.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/")
+def read_root():
+    return FileResponse("index.html")
